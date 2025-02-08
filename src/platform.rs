@@ -1,7 +1,10 @@
 use std::error::Error;
-use std::fs;
+use std::{fs, string};
 use std::process::Command;
 use crate::error::MacError;
+use is_elevated;
+use winreg::{RegKey, RegValue};
+use winreg::enums::*;
 
 #[cfg(target_os = "linux")]
 fn find_command(cmd: &str) -> Option<String> {
@@ -12,6 +15,28 @@ fn find_command(cmd: &str) -> Option<String> {
         "/usr/bin",
         "/usr/local/sbin",
         "/usr/local/bin"
+    ];
+
+    for path in paths {
+        let full_path = format!("{}/{}", path, cmd);
+        if std::path::Path::new(&full_path).exists() {
+            return Some(full_path);
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "windows")]
+fn find_command(cmd: &str) -> Option<String> {
+    let paths = vec![
+        "C:\\tools",
+        "C:\\ProgramData",
+        "C:\\Users\\Nathan\\AppData\\Roaming",
+        "C:\\ProgramData\\chocolatey",
+        "C:\\Program Files\\Common Files",
+        "C:\\Program Files (x86)\\Common Files",
+        "C:\\Program Files\\Common Files",
+        "C:\\Windows",
     ];
 
     for path in paths {
@@ -40,6 +65,31 @@ fn verify_interface_exists(interface: &str) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+#[cfg(target_os = "windows")]
+fn verify_interface_exists(interface: &str) -> Result<(), Box<dyn Error>> {
+    // On Windows, we'll use WMI to verify the interface
+    let output = Command::new("wmic")
+        .args(&["nic", "get", "name,netconnectionid", "/format:csv"])
+        .output()?;
+
+    let output_str = String::from_utf8_lossy(&output.stdout);
+    if !output_str.to_lowercase().contains(&interface.to_lowercase()) {
+        return Err(Box::new(MacError::ValidationFailed(
+            format!("Interface {} does not exist", interface)
+        )));
+    }
+
+    // Check if interface is enabled using netsh
+    let status = Command::new("netsh")
+        .args(&["interface", "show", "interface", interface])
+        .output()?;
+
+    let status_str = String::from_utf8_lossy(&status.stdout);
+    println!("Interface {} current state: {}", interface, status_str.trim());
+
+    Ok(())
+}
+
 #[cfg(target_os = "linux")]
 fn check_permissions() -> Result<(), Box<dyn Error>> {
     if !nix::unistd::Uid::effective().is_root() {
@@ -51,10 +101,44 @@ fn check_permissions() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+#[cfg(target_os = "windows")]
+fn check_permissions() -> Result<(), Box<dyn Error>> {
+    if !is_elevated::is_elevated() {
+        return Err(Box::new(MacError::PermissionDenied(
+            "This program must be run with Administrator privileges. Please use as admin.".into()
+        )));
+    }
+
+    Ok(())
+}
+
 #[cfg(target_os = "linux")]
 fn execute_command(cmd: &str, args: &[&str]) -> Result<(), Box<dyn Error>> {
     let output = Command::new("sudo")
         .arg(cmd)
+        .args(args)
+        .output()?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let error_msg = if !stderr.is_empty() {
+            stderr.to_string()
+        } else if !stdout.is_empty() {
+            stdout.to_string()
+        } else {
+            "Unknown error".to_string()
+        };
+
+        return Err(Box::new(MacError::SystemError(error_msg)));
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn execute_command(cmd: &str, args: &[&str]) -> Result<(), Box<dyn Error>> {
+    let output = Command::new(cmd)
         .args(args)
         .output()?;
 
@@ -145,6 +229,92 @@ pub fn change_mac(interface: &str, mac: &str, permanent: bool) -> Result<(), Box
     Ok(())
 }
 
+#[cfg(target_os = "windows")]
+fn find_network_adapter(interface: &str) -> Result<(RegKey, String), Box<dyn Error>> {
+    let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+    let net_reg_path = "SYSTEM\\CurrentControlSet\\Control\\Class\\{4D36E972-E325-11CE-BFC1-08002BE10318}";
+    let net_reg_key = hklm.open_subkey_with_flags(net_reg_path, KEY_READ | KEY_WRITE)?;
+
+    // First get the exact adapter name from Windows
+    let output = Command::new("wmic")
+        .args(&["nic", "where", &format!("NetConnectionID='{}'", interface), "get", "Name,NetConnectionID", "/format:csv"])
+        .output()?;
+
+    let output_str = String::from_utf8_lossy(&output.stdout);
+    let mut adapter_name = String::new();
+    let mut found_adapter = false;
+
+    for line in output_str.lines().skip(1) { // Skip header
+        let parts: Vec<&str> = line.split(',').collect();
+        if parts.len() >= 3 && parts[2].trim() == interface {
+            adapter_name = parts[1].trim().to_string();
+            found_adapter = true;
+            break;
+        }
+    }
+
+    if !found_adapter {
+        return Err(Box::new(MacError::ValidationFailed(
+            format!("Could not find adapter with name {}", interface)
+        )));
+    }
+
+    // Now search through registry for this adapter
+    for subkey_name in net_reg_key.enum_keys() {
+        let subkey_name = subkey_name?;
+        if let Ok(subkey) = net_reg_key.open_subkey_with_flags(&subkey_name, KEY_READ | KEY_WRITE) {
+            if let Ok(driver_desc) = subkey.get_value::<String, &str>("DriverDesc") {
+                if driver_desc.trim() == adapter_name {
+                    return Ok((subkey, interface.to_string()));
+                }
+            }
+        }
+    }
+
+    Err(Box::new(MacError::SystemError(
+        format!("Could not find registry key for interface {}", interface)
+    )))
+}
+
+#[cfg(target_os = "windows")]
+pub fn change_mac(interface: &str, mac: &str, permanent: bool) -> Result<(), Box<dyn Error>> {
+    // Verify admin privileges first
+    check_permissions()?;
+
+    // Get the network adapter's registry information
+    let (adapter_key, adapter_name) = find_network_adapter(interface)?;
+
+    println!("Found network adapter: {}", adapter_name);
+    println!("Changing MAC address to {}...", mac);
+
+    // Disable the network adapter
+    println!("Disabling network adapter...");
+    execute_command(
+        "netsh",
+        &["interface", "set", "interface", &adapter_name, "admin=disable"]
+    )?;
+
+    // Set the MAC address in registry
+    let cleaned_mac = mac.replace(":", "").replace("-", "").replace(".", "");
+    adapter_key.set_value("NetworkAddress", &cleaned_mac)?;
+
+    // Enable the network adapter
+    println!("Enabling network adapter...");
+    execute_command(
+        "netsh",
+        &["interface", "set", "interface", &adapter_name, "admin=enable"]
+    )?;
+
+    // Wait for interface to come back up
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    // Verify the change
+    println!("Verifying MAC address change...");
+    verify_mac_change(&adapter_name, mac)?;
+
+    Ok(())
+}
+
 #[cfg(target_os = "linux")]
 fn verify_mac_change(interface: &str, expected_mac: &str) -> Result<(), Box<dyn Error>> {
     // Wait a bit for the change to take effect
@@ -152,6 +322,34 @@ fn verify_mac_change(interface: &str, expected_mac: &str) -> Result<(), Box<dyn 
 
     let current_mac = crate::network::get_current_mac(interface)?;
     if current_mac.to_lowercase() != expected_mac.to_lowercase() {
+        return Err(Box::new(MacError::ValidationFailed(
+            format!("MAC address change verification failed. Expected {}, got {}",
+                    expected_mac, current_mac)
+        )));
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn verify_mac_change(interface: &str, expected_mac: &str) -> Result<(), Box<dyn Error>> {
+    // Wait a bit for the change to take effect
+    std::thread::sleep(std::time::Duration::from_secs(1));
+
+    let current_mac = crate::network::get_current_mac(interface)?;
+
+    // Convert both MACs to the same format (hyphen-separated) for comparison
+    let expected_mac = expected_mac
+        .replace(":", "-")
+        .replace(".", "-")
+        .to_lowercase();
+
+    let current_mac = current_mac
+        .replace(":", "-")
+        .replace(".", "-")
+        .to_lowercase();
+
+    if current_mac != expected_mac {
         return Err(Box::new(MacError::ValidationFailed(
             format!("MAC address change verification failed. Expected {}, got {}",
                     expected_mac, current_mac)
@@ -191,6 +389,12 @@ fn make_permanent(interface: &str, mac: &str) -> Result<(), Box<dyn Error>> {
         .output()
         .map_err(|e| MacError::SystemError(format!("Failed to reload udev rules: {}", e)))?;
 
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn make_permanent(_interface: &str, _mac: &str) -> Result<(), Box<dyn Error>> {
+    // On Windows, the registry change made in change_mac() is already permanent
     Ok(())
 }
 

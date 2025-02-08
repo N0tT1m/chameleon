@@ -14,6 +14,8 @@ pub struct NetworkCard {
 }
 
 impl NetworkCard {
+    #[cfg(not(target_os = "windows"))]
+
     pub fn verify_interface(interface: &str) -> Result<Self, Box<dyn Error>> {
         let interfaces = pnet::datalink::interfaces();
 
@@ -110,9 +112,10 @@ impl NetworkCard {
     }
 
     #[cfg(target_os = "windows")]
-    fn new(interface: &str) -> Result<Self, Box<dyn Error>> {
-        let output = Command::new("wmic")
-            .args(&["nic", "get", "name,manufacturer,servicename"])
+    pub fn verify_interface(interface: &str) -> Result<Self, Box<dyn Error>> {
+        // Use getmac to verify interface exists
+        let output = Command::new("getmac")
+            .args(&["/v", "/fo", "csv"])
             .output()?;
 
         if !output.status.success() {
@@ -121,12 +124,52 @@ impl NetworkCard {
             )));
         }
 
+        let output_str = String::from_utf8_lossy(&output.stdout);
+        if !output_str.lines().any(|line| line.contains(interface)) {
+            return Err(Box::new(MacError::ValidationFailed(
+                format!("Interface {} not found", interface)
+            )));
+        }
+
+        Self::new(interface)
+    }
+
+    #[cfg(target_os = "windows")]
+    fn new(interface: &str) -> Result<Self, Box<dyn Error>> {
+        // Get interface details using wmic
+        let output = Command::new("wmic")
+            .args(&["nic", "where", &format!("NetConnectionID='{}'", interface), "get", "Manufacturer,ServiceName,Name", "/format:csv"])
+            .output()?;
+
+        if !output.status.success() {
+            return Err(Box::new(MacError::SystemError(
+                String::from_utf8_lossy(&output.stderr).to_string()
+            )));
+        }
+
+        let output_str = String::from_utf8_lossy(&output.stdout);
+        let lines: Vec<&str> = output_str.lines().collect();
+
+        // Skip header row and get first data row
+        let vendor = lines.get(1)
+            .and_then(|line| line.split(',').nth(1))
+            .map(|s| s.trim().to_string());
+
+        let driver = lines.get(1)
+            .and_then(|line| line.split(',').nth(2))
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+
+        // Check if interface supports MAC address changes
+        // Most Windows network interfaces support this, but we can add additional checks here
+        let supports_mac_change = true;
+
         Ok(NetworkCard {
             interface: interface.to_string(),
-            vendor: None,
-            supports_mac_change: true,
+            vendor,
+            supports_mac_change,
             permanent_change_supported: true,
-            driver: String::new(),
+            driver,
         })
     }
 }
