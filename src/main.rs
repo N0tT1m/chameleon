@@ -179,6 +179,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut mac_filter = MacFilter::new();
     let mac_logger = MacLogger::new();
 
+    let provided_mac = cli.mac.clone();
+
     // Verify interface
     let card = NetworkCard::verify_interface(&cli.interface)?;
     println!("Detected network card: {:?}", card);
@@ -302,8 +304,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         } else {
             mac::generate_random_mac(cli.vendor.as_deref())?.to_string()
         }
-    } else if let Some(mac) = cli.mac {
-        mac
+    } else if let Some(mac) = provided_mac {
+        mac.to_string()
     } else {
         return Err(Box::new(MacError::ValidationFailed("No MAC address specified".into())));
     };
