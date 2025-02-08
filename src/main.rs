@@ -8,6 +8,7 @@ mod geolocation;
 mod filter;
 mod logger;
 mod rules;
+mod oui;
 
 use crate::geolocation::GeoLocationService;
 use crate::filter::MacFilter;
@@ -193,17 +194,21 @@ fn check_privileges() -> Result<(), MacError> {
     Ok(())
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
+// Inside src/main.rs
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {  // Change return type to use dyn Error
     let cli = Cli::parse();
 
     // Validate arguments
-    cli.validate()?;
+    cli.validate()?;  // MacError will automatically convert to Box<dyn Error>
 
     // Check privileges
     check_privileges()?;
 
     // Initialize services
     let mut geo_service = GeoLocationService::new();
+    let mut oui_db = oui::OUIDatabase::new()?;
     let mut mac_filter = MacFilter::new();
     let mac_logger = MacLogger::new();
     let mut rule_manager = RuleManager::new()?;
@@ -215,12 +220,17 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("Detected network card: {:?}", card);
 
     if cli.restore {
-        if let Some(original_mac) = get_original_mac(&cli.interface)? {
-            println!("Restoring original MAC address: {}", original_mac);
-            change_mac(&cli.interface, &original_mac, false)?;
-            println!("Successfully restored original MAC address");
-        } else {
-            return Err(Box::new(MacError::ValidationFailed("No original MAC address saved".into())));
+        match get_original_mac(&cli.interface)? {
+            Some(original_mac) => {
+                println!("Restoring original MAC address: {}", original_mac);
+                change_mac(&cli.interface, &original_mac, false)?;
+                println!("Successfully restored original MAC address");
+            }
+            None => {
+                return Err(MacError::ValidationFailed(
+                    "No original MAC address saved".into()
+                ).into());  // Use .into() to convert to Box<dyn Error>
+            }
         }
         return Ok(());
     }
@@ -233,7 +243,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     } else if let Some(mac) = cli.mac {
         mac
     } else {
-        return Err(Box::new(MacError::ValidationFailed("No MAC address specified".into())));
+        return Err(MacError::ValidationFailed(
+            "No MAC address specified".into()
+        ).into());
     };
 
     // Save original MAC if first time
@@ -249,50 +261,18 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     }
 
-    // Check for platform compatibility with permanent changes
-    #[cfg(target_os = "macos")]
-    if cli.permanent {
-        println!("Warning: Permanent MAC address changes are not supported on macOS.");
-        println!("Continuing with temporary change...");
-        // Force permanent to false on macOS
-        cli.permanent = false;
-    }
-
-    // Save original MAC if first time (only for non-restore operations)
-    if !cli.restore && get_original_mac(&cli.interface)?.is_none() {
-        match network::get_current_mac(&cli.interface) {
-            Ok(current_mac) => {
-                println!("Saving original MAC address: {}", current_mac);
-                save_original_mac(&cli.interface, &current_mac)?;
-            },
-            Err(e) => {
-                println!("Warning: Could not save original MAC address: {}", e);
-            }
-        }
-    }
-
-    // Change MAC
-    println!("Changing MAC address to {} for interface {}", new_mac, cli.interface);
-
+    // Platform-specific permanent flag handling
     #[cfg(not(target_os = "macos"))]
     let permanent = cli.permanent;
 
     #[cfg(target_os = "macos")]
-    let permanent = false;
-
-    change_mac(&cli.interface, &new_mac, permanent)?;
-
-    // Print success message
-    if cli.restore {
-        println!("Successfully restored original MAC address");
-    } else {
-        println!("Successfully changed MAC address");
+    let permanent = {
         if cli.permanent {
-            println!("Changes have been made permanent");
-        } else {
-            println!("Note: This change is temporary. Use -p to make it permanent");
+            println!("Warning: Permanent MAC address changes are not supported on macOS.");
+            println!("Continuing with temporary change...");
         }
-    }
+        false
+    };
 
     // Handle filter commands
     if let Some(prefix) = cli.whitelist {
@@ -320,108 +300,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
-    // Get new MAC address
-    let new_mac = if cli.random {
-        if let Some(country) = &cli.spoof_location {
-            if let Some(mac) = geo_service.suggest_mac_for_location(country) {
-                mac
-            } else {
-                return Err(Box::new(MacError::ValidationFailed(
-                    format!("No vendor found for country {}", country)
-                )));
-            }
-        } else {
-            mac::generate_random_mac(cli.vendor.as_deref())?.to_string()
-        }
-    } else if let Some(mac) = provided_mac {
-        mac.to_string()
-    } else {
-        return Err(Box::new(MacError::ValidationFailed("No MAC address specified".into())));
-    };
-
-    // Check against filters
-    if !mac_filter.is_allowed(&new_mac) {
-        return Err(Box::new(MacError::ValidationFailed("MAC address not allowed by filters".into())));
-    }
-
-    // Handle rule commands
-    if cli.list_rules {
-        println!("Application Rules:");
-        for rule in rule_manager.list_rules() {
-            println!("\nApp: {}", rule.app_name);
-            if let Some(service) = &rule.service_name {
-                println!("Service: {}", service);
-            }
-            println!("Interface: {}", rule.interface);
-            println!("MAC: {}", rule.mac_address);
-            if let Some(schedule) = &rule.schedule {
-                println!("Schedule: {} {}:{}",
-                         schedule.days.join(","),
-                         schedule.start_time,
-                         schedule.end_time
-                );
-            }
-            println!("Status: {}", if rule.enabled { "Enabled" } else { "Disabled" });
-        }
-        return Ok(());
-    }
-
-    if cli.remove_rule {
-        let app_name = cli.app_name.ok_or("Application name required")?;
-        rule_manager.remove_rule(&app_name, &cli.interface)?;
-        println!("Rule removed successfully");
-        return Ok(());
-    }
-
-    // Handle rule addition
-    if cli.add_rule {
-        let app_name = cli.app_name.ok_or("Application name required")?;
-
-        let schedule = if let Some(sched_str) = cli.schedule {
-            let parts: Vec<&str> = sched_str.split(':').collect();
-            if parts.len() != 2 {
-                return Err("Invalid schedule format".into());
-            }
-
-            let days: Vec<String> = parts[0].split(',').map(|s| s.to_string()).collect();
-            let times: Vec<&str> = parts[1].split('-').collect();
-            if times.len() != 2 {
-                return Err("Invalid time format".into());
-            }
-
-            Some(Schedule {
-                days,
-                start_time: times[0].to_string(),
-                end_time: times[1].to_string(),
-            })
-        } else {
-            None
-        };
-
-        let rule = AppRule {
-            app_name,
-            service_name: cli.service_name,
-            mac_address: new_mac,
-            interface: cli.interface.clone(),
-            schedule,
-            last_applied: None,
-            enabled: true,
-        };
-
-        rule_manager.add_rule(rule)?;
-        println!("Rule added successfully");
-        return Ok(());
-    }
-
     // Check application rules
     let running_apps = get_running_applications()?;
     for rule in rule_manager.list_rules() {
         if rule.interface == cli.interface &&
             running_apps.contains(&rule.app_name) &&
-            rule_manager.is_rule_active(rule) {
+            rule_manager.is_rule_active(&rule) {
             println!("Found active rule for running application: {}", rule.app_name);
             println!("Using rule-specified MAC address: {}", rule.mac_address);
-            return change_mac(&cli.interface, &rule.mac_address, cli.permanent);
+            return change_mac(&cli.interface, &rule.mac_address, permanent);
         }
     }
 
@@ -429,7 +316,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let old_mac = network::get_current_mac(&cli.interface)?;
 
     // Change MAC
-    change_mac(&cli.interface, &new_mac, cli.permanent)?;
+    change_mac(&cli.interface, &new_mac, permanent)?;
 
     // Log the change
     let change = MacChange {
@@ -438,7 +325,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         old_mac,
         new_mac,
         geo_location: cli.spoof_location,
-        permanent: cli.permanent,
+        permanent,
     };
     mac_logger.log_change(change)?;
 

@@ -1,7 +1,9 @@
+// src/geolocation.rs
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::collections::HashMap;
-use reqwest;
+use crate::error::MacError;
+use crate::oui::OUIDatabase;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GeoLocation {
@@ -11,41 +13,18 @@ pub struct GeoLocation {
     pub vendor: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct VendorInfo {
-    pub prefix: String,
-    pub name: String,
-    pub country: String,
-}
-
 pub struct GeoLocationService {
-    vendor_db: HashMap<String, VendorInfo>,
     cache: HashMap<String, GeoLocation>,
 }
 
 impl GeoLocationService {
     pub fn new() -> Self {
         Self {
-            vendor_db: Self::load_vendor_db(),
             cache: HashMap::new(),
         }
     }
 
-    fn load_vendor_db() -> HashMap<String, VendorInfo> {
-        // Load from local OUI database
-        let db_path = dirs::config_dir()
-            .unwrap_or_default()
-            .join("mac_changer")
-            .join("oui.json");
-
-        if let Ok(content) = std::fs::read_to_string(db_path) {
-            serde_json::from_str(&content).unwrap_or_default()
-        } else {
-            HashMap::new()
-        }
-    }
-
-    pub async fn get_location(&mut self, mac: &str) -> Result<GeoLocation, Box<dyn Error>> {
+    pub fn get_location(&mut self, mac: &str, oui_db: &OUIDatabase) -> Result<GeoLocation, Box<dyn Error>> {
         // Check cache first
         if let Some(location) = self.cache.get(mac) {
             return Ok(location.clone());
@@ -54,29 +33,39 @@ impl GeoLocationService {
         // Get vendor prefix
         let prefix = &mac[0..8].to_uppercase();
 
-        // Look up vendor info
-        if let Some(vendor_info) = self.vendor_db.get(prefix) {
-            let location = GeoLocation {
-                country: vendor_info.country.clone(),
-                region: String::new(),
-                city: String::new(),
-                vendor: vendor_info.name.clone(),
-            };
+        // Look up vendor info from OUI database
+        let vendor_info = oui_db.get_vendor(prefix)
+            .ok_or_else(|| MacError::ValidationFailed(
+                format!("No vendor found for prefix {}", prefix)
+            ))?;
 
-            self.cache.insert(mac.to_string(), location.clone());
-            return Ok(location);
-        }
+        let location = GeoLocation {
+            country: vendor_info.country.clone(),
+            region: String::new(),
+            city: String::new(),
+            vendor: vendor_info.name.clone(),
+        };
 
-        Err("Location not found".into())
+        self.cache.insert(mac.to_string(), location.clone());
+        Ok(location)
     }
 
-    pub fn suggest_mac_for_location(&self, country: &str) -> Option<String> {
-        // Find vendor from desired country
-        for vendor in self.vendor_db.values() {
-            if vendor.country == country {
-                return Some(format!("{}:00:00:00", vendor.prefix));
-            }
+    pub fn suggest_mac_for_location(&self, country: &str, oui_db: &OUIDatabase) -> Option<String> {
+        // Find vendors for the specified country
+        let vendors = oui_db.vendors_by_country(country);
+
+        if vendors.is_empty() {
+            return None;
         }
-        None
+
+        // Use the first vendor found
+        let vendor = vendors[0];
+
+        // Generate random suffix
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        let random_suffix: u32 = rng.gen_range(0..0xFFFFFF);
+
+        Some(format!("{}:{:06X}", vendor.prefix, random_suffix))
     }
 }
