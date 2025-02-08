@@ -15,10 +15,10 @@ use std::error::Error;
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "mac_changer",
+    name = "Chameleon",
     about = "A tool to change MAC addresses across different platforms",
     version = "1.0.0",
-    author = "Your Name <your.email@example.com>",
+    author = "Nathan Moritz <nathan.moritz@duocore.dev>",
     long_about = None
 )]
 #[command(group(
