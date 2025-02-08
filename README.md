@@ -31,7 +31,7 @@ A powerful cross-platform MAC address changer with advanced features for network
 
 ```bash
 # Clone the repository
-git clone https://github.com/username/chameleon.git
+git clone https://github.com/n0tt1m/chameleon.git
 cd chameleon
 
 # Build the project
@@ -45,7 +45,7 @@ sudo mv target/release/chameleon /usr/local/bin/
 
 Basic command structure:
 ```bash
-chameleon [OPTIONS] -i <interface> (-r | -m <MAC> | --restore)
+chameleon [OPTIONS] -i <interface> (-r OR --random | -m <MAC> | --restore)
 ```
 
 ### Common Operations
@@ -152,4 +152,3 @@ Nathan Moritz <nathan.moritz@duocore.dev>
 ## Acknowledgments
 
 - Thanks to the Rust community for excellent networking crates
-- Contributors and testers across different platforms
