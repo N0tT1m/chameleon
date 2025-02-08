@@ -4,6 +4,12 @@ mod mac;
 mod network;
 mod platform;
 mod config;
+mod geolocation;
+mod filter;
+mod logger;
+use crate::geolocation::GeoLocationService;
+use crate::filter::MacFilter;
+use crate::logger::{MacLogger, MacChange};
 
 use clap::{Parser, ArgGroup};
 use error::MacError;
@@ -12,6 +18,7 @@ use network::NetworkCard;
 use platform::change_mac;
 use config::{save_original_mac, get_original_mac};
 use std::error::Error;
+use chrono::Utc;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -83,6 +90,22 @@ struct Cli {
         conflicts_with_all = ["random", "mac", "permanent", "vendor"]
     )]
     restore: bool,
+
+    /// Spoof location to specific country
+    #[arg(long, value_name = "COUNTRY")]
+    spoof_location: Option<String>,
+
+    /// Add MAC prefix to whitelist
+    #[arg(long, value_name = "PREFIX")]
+    whitelist: Option<String>,
+
+    /// Add MAC prefix to blacklist
+    #[arg(long, value_name = "PREFIX")]
+    blacklist: Option<String>,
+
+    /// Show MAC change history
+    #[arg(long)]
+    history: bool,
 }
 
 impl Cli {
@@ -150,6 +173,11 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // Check privileges
     check_privileges()?;
+
+    // Initialize services
+    let mut geo_service = GeoLocationService::new();
+    let mut mac_filter = MacFilter::new();
+    let mac_logger = MacLogger::new();
 
     // Verify interface
     let card = NetworkCard::verify_interface(&cli.interface)?;
@@ -234,6 +262,73 @@ fn main() -> Result<(), Box<dyn Error>> {
             println!("Note: This change is temporary. Use -p to make it permanent");
         }
     }
+
+    // Handle filter commands
+    if let Some(prefix) = cli.whitelist {
+        mac_filter.add_to_whitelist(&prefix)?;
+        println!("Added {} to whitelist", prefix);
+        return Ok(());
+    }
+
+    if let Some(prefix) = cli.blacklist {
+        mac_filter.add_to_blacklist(&prefix)?;
+        println!("Added {} to blacklist", prefix);
+        return Ok(());
+    }
+
+    if cli.history {
+        let history = mac_logger.get_history()?;
+        for change in history {
+            println!("{}: {} -> {} ({})",
+                     change.timestamp,
+                     change.old_mac,
+                     change.new_mac,
+                     change.interface
+            );
+        }
+        return Ok(());
+    }
+
+    // Get new MAC address
+    let new_mac = if cli.random {
+        if let Some(country) = &cli.spoof_location {
+            if let Some(mac) = geo_service.suggest_mac_for_location(country) {
+                mac
+            } else {
+                return Err(Box::new(MacError::ValidationFailed(
+                    format!("No vendor found for country {}", country)
+                )));
+            }
+        } else {
+            mac::generate_random_mac(cli.vendor.as_deref())?.to_string()
+        }
+    } else if let Some(mac) = cli.mac {
+        mac
+    } else {
+        return Err(Box::new(MacError::ValidationFailed("No MAC address specified".into())));
+    };
+
+    // Check against filters
+    if !mac_filter.is_allowed(&new_mac) {
+        return Err(Box::new(MacError::ValidationFailed("MAC address not allowed by filters".into())));
+    }
+
+    // Get current MAC for logging
+    let old_mac = network::get_current_mac(&cli.interface)?;
+
+    // Change MAC
+    change_mac(&cli.interface, &new_mac, cli.permanent)?;
+
+    // Log the change
+    let change = MacChange {
+        timestamp: Utc::now(),
+        interface: cli.interface,
+        old_mac,
+        new_mac,
+        geo_location: cli.spoof_location,
+        permanent: cli.permanent,
+    };
+    mac_logger.log_change(change)?;
 
     Ok(())
 }
