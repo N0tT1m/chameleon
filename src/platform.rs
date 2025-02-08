@@ -1,4 +1,5 @@
 use std::error::Error;
+use std::fs;
 use std::process::Command;
 use crate::error::MacError;
 
@@ -191,4 +192,45 @@ fn make_permanent(interface: &str, mac: &str) -> Result<(), Box<dyn Error>> {
         .map_err(|e| MacError::SystemError(format!("Failed to reload udev rules: {}", e)))?;
 
     Ok(())
+}
+
+pub fn get_running_applications() -> Result<Vec<String>, Box<dyn Error>> {
+    let mut apps = Vec::new();
+
+    #[cfg(target_os = "linux")]
+    {
+        // Get running processes from /proc
+        for entry in fs::read_dir("/proc")? {
+            let entry = entry?;
+            if let Ok(name) = fs::read_to_string(entry.path().join("comm")) {
+                apps.push(name.trim().to_string());
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let output = std::process::Command::new("ps")
+            .args(&["-e", "-o", "comm="])
+            .output()?;
+
+        let output_str = String::from_utf8_lossy(&output.stdout);
+        apps.extend(output_str.lines().map(|s| s.trim().to_string()));
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let output = std::process::Command::new("tasklist")
+            .args(&["/FO", "CSV", "/NH"])
+            .output()?;
+
+        let output_str = String::from_utf8_lossy(&output.stdout);
+        for line in output_str.lines() {
+            if let Some(name) = line.split(',').next() {
+                apps.push(name.trim_matches('"').to_string());
+            }
+        }
+    }
+
+    Ok(apps)
 }

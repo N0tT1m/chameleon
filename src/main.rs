@@ -7,6 +7,8 @@ mod config;
 mod geolocation;
 mod filter;
 mod logger;
+mod rules;
+
 use crate::geolocation::GeoLocationService;
 use crate::filter::MacFilter;
 use crate::logger::{MacLogger, MacChange};
@@ -19,6 +21,8 @@ use platform::change_mac;
 use config::{save_original_mac, get_original_mac};
 use std::error::Error;
 use chrono::Utc;
+use crate::platform::get_running_applications;
+use crate::rules::{AppRule, RuleManager, Schedule};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -106,6 +110,30 @@ struct Cli {
     /// Show MAC change history
     #[arg(long)]
     history: bool,
+
+    /// Add application-specific MAC rule
+    #[arg(long)]
+    add_rule: bool,
+
+    /// Application name for rule
+    #[arg(long)]
+    app_name: Option<String>,
+
+    /// Service name for rule (optional)
+    #[arg(long)]
+    service_name: Option<String>,
+
+    /// Schedule for rule (days:start-end), e.g., "mon,tue,wed:09:00-17:00"
+    #[arg(long)]
+    schedule: Option<String>,
+
+    /// List all application rules
+    #[arg(long)]
+    list_rules: bool,
+
+    /// Remove application rule
+    #[arg(long)]
+    remove_rule: bool,
 }
 
 impl Cli {
@@ -178,6 +206,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut geo_service = GeoLocationService::new();
     let mut mac_filter = MacFilter::new();
     let mac_logger = MacLogger::new();
+    let mut rule_manager = RuleManager::new()?;
 
     let provided_mac = cli.mac.clone();
 
@@ -313,6 +342,87 @@ fn main() -> Result<(), Box<dyn Error>> {
     // Check against filters
     if !mac_filter.is_allowed(&new_mac) {
         return Err(Box::new(MacError::ValidationFailed("MAC address not allowed by filters".into())));
+    }
+
+    // Handle rule commands
+    if cli.list_rules {
+        println!("Application Rules:");
+        for rule in rule_manager.list_rules() {
+            println!("\nApp: {}", rule.app_name);
+            if let Some(service) = &rule.service_name {
+                println!("Service: {}", service);
+            }
+            println!("Interface: {}", rule.interface);
+            println!("MAC: {}", rule.mac_address);
+            if let Some(schedule) = &rule.schedule {
+                println!("Schedule: {} {}:{}",
+                         schedule.days.join(","),
+                         schedule.start_time,
+                         schedule.end_time
+                );
+            }
+            println!("Status: {}", if rule.enabled { "Enabled" } else { "Disabled" });
+        }
+        return Ok(());
+    }
+
+    if cli.remove_rule {
+        let app_name = cli.app_name.ok_or("Application name required")?;
+        rule_manager.remove_rule(&app_name, &cli.interface)?;
+        println!("Rule removed successfully");
+        return Ok(());
+    }
+
+    // Handle rule addition
+    if cli.add_rule {
+        let app_name = cli.app_name.ok_or("Application name required")?;
+
+        let schedule = if let Some(sched_str) = cli.schedule {
+            let parts: Vec<&str> = sched_str.split(':').collect();
+            if parts.len() != 2 {
+                return Err("Invalid schedule format".into());
+            }
+
+            let days: Vec<String> = parts[0].split(',').map(|s| s.to_string()).collect();
+            let times: Vec<&str> = parts[1].split('-').collect();
+            if times.len() != 2 {
+                return Err("Invalid time format".into());
+            }
+
+            Some(Schedule {
+                days,
+                start_time: times[0].to_string(),
+                end_time: times[1].to_string(),
+            })
+        } else {
+            None
+        };
+
+        let rule = AppRule {
+            app_name,
+            service_name: cli.service_name,
+            mac_address: new_mac,
+            interface: cli.interface.clone(),
+            schedule,
+            last_applied: None,
+            enabled: true,
+        };
+
+        rule_manager.add_rule(rule)?;
+        println!("Rule added successfully");
+        return Ok(());
+    }
+
+    // Check application rules
+    let running_apps = get_running_applications()?;
+    for rule in rule_manager.list_rules() {
+        if rule.interface == cli.interface &&
+            running_apps.contains(&rule.app_name) &&
+            rule_manager.is_rule_active(rule) {
+            println!("Found active rule for running application: {}", rule.app_name);
+            println!("Using rule-specified MAC address: {}", rule.mac_address);
+            return change_mac(&cli.interface, &rule.mac_address, cli.permanent);
+        }
     }
 
     // Get current MAC for logging
